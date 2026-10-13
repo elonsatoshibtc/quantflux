@@ -1,10 +1,14 @@
 """QuantFlux end-to-end paper-trading runner.
 
-Wires the six layers together:
-    market_data -> signal_router -> risk.guard -> execution.paper_broker
+Wires the layers together:
+    market_data -> {signal_router | strategy} -> risk.guard -> execution.paper_broker
     with charting + structured logging on the side.
 
-Run:  python -m quantflux.runner --iterations 500
+Two signal sources are supported:
+  --strategy ema    drive orders from DualMovingAverageStrategy (default)
+  --strategy random drive orders from the synthetic webhook injector
+
+Run:  python -m quantflux.runner --iterations 1000 --strategy ema
 This NEVER connects to a live exchange and NEVER uses API keys.
 """
 
@@ -20,6 +24,7 @@ from quantflux.execution.paper_broker import PaperBroker
 from quantflux.market_data.feed import SyntheticFeed, Tick
 from quantflux.risk.guard import RiskGuard
 from quantflux.signal_router.router import Signal, SignalRouter, compute_signature
+from quantflux.strategy.base import DualMovingAverageStrategy
 from quantflux.utils.logging_setup import log_event, setup_logging
 
 
@@ -27,11 +32,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="QuantFlux paper-trading runner")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--strategy", choices=("ema", "random"), default="ema",
+                        help="signal source: ema (DualMovingAverageStrategy) or random webhook injector")
+    parser.add_argument("--symbol", default="BTC/USDT")
+    parser.add_argument("--qty", type=float, default=0.001)
+    parser.add_argument("--ema-fast", type=int, default=8)
+    parser.add_argument("--ema-slow", type=int, default=21)
+    parser.add_argument("--min-bars", type=int, default=30)
     args = parser.parse_args()
 
     cfg = load_config()
     logger = setup_logging(cfg.log_dir)
-    log_event(logger, "startup", event="startup", meta={"mode": cfg.execution.mode.value})
+    log_event(logger, "startup", event="startup",
+              meta={"mode": cfg.execution.mode.value, "strategy": args.strategy})
 
     feed = SyntheticFeed(cfg.market_data, seed=args.seed)
     broker = PaperBroker(cfg.execution)
@@ -39,6 +52,15 @@ def main() -> int:
     charting = ChartingFeed(cfg.charting)
     rng = random.Random(args.seed)
     processed = {"accepted": 0, "rejected": 0, "signals": 0}
+
+    strategy = DualMovingAverageStrategy(
+        symbol=args.symbol,
+        side="buy",
+        qty=args.qty,
+        ema_fast_period=args.ema_fast,
+        ema_slow_period=args.ema_slow,
+        min_bars=args.min_bars,
+    )
 
     def on_signal(sig: Signal) -> None:
         processed["signals"] += 1
@@ -59,28 +81,41 @@ def main() -> int:
                       side=fill.side, qty=fill.qty, price=fill.price)
 
     router = SignalRouter(cfg.signal_router, on_signal)
-    router.cfg.hmac_secret  # noqa: B018 (documented fixed secret in paper mode)
 
     for i in range(args.iterations):
         for sym in cfg.market_data.symbols:
             tick: Tick = feed.next_tick(sym)
             broker.mark(tick)
             charting.ingest(tick)
-            if rng.random() < 0.05:  # ~5% chance of an inbound webhook signal
-                _inject_signed_signal(router, cfg, tick, rng, i)
+
+            if args.strategy == "ema":
+                if sym == strategy.symbol:
+                    strategy.on_tick(tick)
+                    for sig in strategy.generate_signals():
+                        if sig.side not in ("buy", "sell"):
+                            continue
+                        on_signal(sig)
+            else:
+                if rng.random() < 0.05:  # ~5% chance of an inbound webhook signal
+                    _inject_signed_signal(router, cfg, tick, rng, i)
 
     equity = broker.equity()
-    log_event(logger, "shutdown", event="shutdown",
-              meta={"equity": round(equity, 2), **processed})
-    _safe_print(charting.render())
-    print(json.dumps({
+    result = {
         "equity": round(equity, 2),
+        "return_pct": round((equity / cfg.execution.starting_balance_usdt - 1) * 100, 4),
         "fills": len(broker.fills),
         "signals": processed["signals"],
         "accepted": processed["accepted"],
         "rejected": processed["rejected"],
         "kill_switch": guard.killed,
-    }, indent=2))
+        "strategy": args.strategy,
+        "strategy_name": strategy.name if args.strategy == "ema" else "random_webhook",
+        "bars": strategy.bars_consumed if args.strategy == "ema" else args.iterations,
+        "crosses": strategy.crosses if args.strategy == "ema" else 0,
+    }
+    log_event(logger, "shutdown", event="shutdown", meta=result)
+    _safe_print(charting.render())
+    print(json.dumps(result, indent=2))
     return 0
 
 

@@ -103,6 +103,7 @@ class DualMovingAverageStrategy(SignalStrategy):
         self._last_cross: str | None = None
         self._last_cross_bar: int = -1
         self._crosses = 0
+        self._pending_signal: str | None = None  # set on cross, cleared on emit
 
     @property
     def fast_ema(self) -> float | None:
@@ -148,6 +149,7 @@ class DualMovingAverageStrategy(SignalStrategy):
                 # sign change from flat or previous direction
                 self._crosses += 1
                 self._last_cross = "up" if diff > 0 else "down"
+                self._pending_signal = self._last_cross  # emit once on this cross
                 self._prev_diff = diff
             elif diff != 0:
                 # just update prev_diff if diff is non-zero
@@ -156,10 +158,16 @@ class DualMovingAverageStrategy(SignalStrategy):
             self._prev_diff = diff
 
     def generate_signals(self) -> list[Signal]:
+        """Emit at most one signal, only on the bar where a cross occurred.
+
+        The pending signal is consumed on emission so we do not spam duplicate
+        orders on every subsequent bar (which the risk rate-limiter would
+        reject anyway).
+        """
         signals: list[Signal] = []
         if self._fast_ema is None or self._slow_ema is None:
             return signals
-        if self.last_cross == "up":
+        if self._pending_signal == "up":
             signals.append(
                 Signal(
                     ts="",
@@ -171,7 +179,7 @@ class DualMovingAverageStrategy(SignalStrategy):
                     reason=f"{self.reason}_bullish_cross_{self._crosses}",
                 )
             )
-        elif self.last_cross == "down":
+        elif self._pending_signal == "down":
             signals.append(
                 Signal(
                     ts="",
@@ -183,6 +191,7 @@ class DualMovingAverageStrategy(SignalStrategy):
                     reason=f"{self.reason}_bearish_cross_{self._crosses}",
                 )
             )
+        self._pending_signal = None
         self.signals_emitted += len(signals)
         return signals
 
@@ -194,3 +203,4 @@ class DualMovingAverageStrategy(SignalStrategy):
         self._prev_diff = None
         self._last_cross = None
         self._crosses = 0
+        self._pending_signal = None
